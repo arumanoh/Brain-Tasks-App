@@ -89,3 +89,6 @@ No dependencies are required
 No build process is required
 
 No package.json is needed
+
+## Deployment
+This application is deployed via a full CI/CD pipeline: GitHub -> AWS CodePipeline -> AWS CodeBuild -> Amazon ECR -> Amazon EKS.
