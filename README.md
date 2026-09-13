@@ -1,95 +1,161 @@
-DevOps Practice Project – Dist Directory
+# Brain Tasks App — DevOps Deployment
 
-This repository contains the production-ready build files (dist folder) for DevOps practice and deployment exercises.
+A full AWS CI/CD pipeline deployment of [Brain-Tasks-App](https://github.com/arumanoh/Brain-Tasks-App) (a pre-built static React/Vite `dist/` bundle) to Amazon EKS, built as a DevOps assessment project.
 
-It is intentionally structured to help learners focus on CI/CD pipelines, hosting, containerization, and infrastructure setup rather than application development.
+---
 
-📁 What This Repository Contains
+## Architecture Overview
 
-dist/ – Compiled and production-ready static files
+```
+GitHub (main branch push)
+        │
+        ▼
+  CodePipeline (brain-tasks-app-pipeline)
+        │
+        ├── Source Stage  → GitHub App connection
+        │
+        └── Build Stage   → CodeBuild (brain-tasks-app-build)
+                                │
+                                ├── docker build → push to ECR
+                                └── kubectl apply → deploy to EKS
+                                        │
+                                        ▼
+                              EKS Cluster (brain-tasks-cluster)
+                                        │
+                                Deployment (2 replicas, nginx:1.27-alpine)
+                                        │
+                                Service (LoadBalancer / NLB)
+                                        │
+                                        ▼
+                                  End users (internet)
+```
 
-HTML
+Logs from every stage (build, cluster control plane, and running application pods) are shipped to **CloudWatch Logs** for monitoring.
 
-CSS
+---
 
-JavaScript
+## Environment
 
-Assets (images, fonts, etc.)
+| Component | Detail |
+|---|---|
+| EC2 (ops/admin host) | Ubuntu 26.04, `t3.small`, region `eu-north-1` |
+| EC2 IAM role | `brain-tasks-app-ec2-role` — ECR full access, inline `eks:*`, `CloudWatchLogsReadOnlyAccess` |
+| Working directory | `~/Brain-Tasks-App` |
+| Source repo | `https://github.com/arumanoh/Brain-Tasks-App` (`main` branch) |
 
-These files are ready to deploy to:
+---
 
-Web servers (Nginx / Apache)
+## 1. Containerization (Docker)
 
-Cloud platforms (AWS S3, Azure Blob, GCP Storage)
+- **`Dockerfile`** — based on `nginx:1.27-alpine`, serves the pre-built static `dist/` bundle.
+- **`nginx.conf`** — configured to listen on port 3000, with SPA fallback routing (`try_files` → `index.html`) so client-side React routes resolve correctly.
+- Built and verified locally in a browser before pushing to ECR.
 
-Containerized environments (Docker + Nginx)
+## 2. Image Registry (Amazon ECR)
 
-Kubernetes clusters
+- Repository: `brain-tasks-app` in `eu-north-1`
+- Image URI: `367061003285.dkr.ecr.eu-north-1.amazonaws.com/brain-tasks-app`
+- Status: `ACTIVE`, confirmed pushed successfully.
 
-CI/CD pipeline demonstrations
+## 3. Kubernetes Cluster (Amazon EKS)
 
-🎯 Purpose of This Repository
+- Cluster: `brain-tasks-cluster`, created via `eksctl`
+- Nodes: 2 × `t3.small`, Kubernetes version `1.34`, status `Ready`
+- Control-plane logging: all 5 CloudWatch log types enabled (API server, audit, authenticator, controller manager, scheduler)
 
-This repository is designed for:
+## 4. Kubernetes Manifests
 
-DevOps beginners
+- **`k8s/deployment.yaml`** — 2 replicas, readiness/liveness probes, resource limits set
+- **`k8s/service.yaml`** — `type: LoadBalancer` with NLB annotation
 
-CI/CD practice
+Deployed and verified reachable via the Network Load Balancer:
 
-Deployment pipeline testing
+```
+arn:aws:elasticloadbalancing:eu-north-1:367061003285:loadbalancer/net/a097e0edcbe054381ae69dfb7caa746e/b814358c06e3bc51
+```
 
-Docker & Kubernetes deployment exercises
+## 5. Version Control
 
-Web server configuration practice
+All infrastructure and deployment files committed to `main`:
+- `Dockerfile`
+- `nginx.conf`
+- `.dockerignore`
+- `k8s/deployment.yaml`, `k8s/service.yaml`
+- `buildspec.yml`
 
-Reverse proxy and load balancer setup
+## 6. CI — Amazon CodeBuild
 
-The goal is to simulate real-world deployment scenarios using already built application files.
+- Project: `brain-tasks-app-build`
+- Service role: `brain-tasks-codebuild-role`
+  - ECR push permissions
+  - Inline policy: `eks:DescribeCluster`, `eks:ListClusters`
+- Kubernetes RBAC: role mapped to `system:masters` via
+  ```
+  eksctl create iamidentitymapping ...
+  ```
+- Build behavior (`buildspec.yml`): builds the Docker image → pushes to ECR → runs `kubectl apply` against the EKS cluster
+- Verified: new pod revisions roll out successfully after each build
 
-❓ Why is there NO package.json?
+## 7. CD — AWS CodePipeline
 
-You may notice that this repository does not include:
+- Pipeline: `brain-tasks-app-pipeline`
+- Stages:
+  1. **Source** — GitHub (via GitHub App connection)
+  2. **Build** — CodeBuild (deploy step runs inside the buildspec; no separate deploy stage)
+- Verified: a `git push` to `main` automatically triggers the pipeline end-to-end, both stages succeed.
 
-package.json
+### Issues encountered and resolved
+- **GitHub connection silent failure**: the first CodeStar/CodeConnections GitHub connection showed as "Authorized" but was never actually installed as a GitHub App, so the pipeline never triggered. Fixed by deleting the connection and recreating it, this time completing the full **Install & Authorize** step in GitHub.
+- **Pipeline service role missing permission**: added inline policy `AllowGitHubConnectionUse` (`codestar-connections:UseConnection`, `codeconnections:UseConnection`) to the CodePipeline service role.
 
-node_modules
+## 8. Monitoring — CloudWatch
 
-Source code (src/)
+Three log sources feed into CloudWatch:
 
-Build tools configuration
+| Source | Log group | What it captures |
+|---|---|---|
+| CodeBuild | `/aws/codebuild/brain-tasks-app-build` | Build and deploy step output (enabled by default) |
+| EKS control plane | `/aws/eks/brain-tasks-cluster/cluster` | API server, audit, authenticator, controller manager, scheduler |
+| Application pods | `/aws/containerinsights/brain-tasks-cluster/application` | nginx access/error logs from running pods, via CloudWatch Container Insights + Fluent Bit |
 
-✅ Reason:
+**Application log pipeline setup:**
+1. Attached `CloudWatchAgentServerPolicy` to the EKS node IAM role (`eksctl-brain-tasks-cluster-nodegro-NodeInstanceRole-...`).
+2. Deployed the CloudWatch Container Insights quickstart manifest (CloudWatch Agent + Fluent Bit DaemonSets) to the `amazon-cloudwatch` namespace.
+3. Verified both DaemonSets running (`1/1 Ready` on all nodes).
+4. Confirmed all 4 Container Insights log groups created (`application`, `dataplane`, `host`, `performance`).
+5. Verified live nginx access-log entries flowing from the `brain-tasks-app` pods into the `application` log group, including both `kube-probe` health-check traffic and real HTTP requests.
 
-This repository only contains the final production build output (dist), not the development source code.
+---
 
-In a typical project:
+## Repository Structure
 
-Developers write source code.
+```
+Brain-Tasks-App/
+├── dist/                  # Pre-built static React/Vite bundle
+├── Dockerfile
+├── nginx.conf
+├── .dockerignore
+├── buildspec.yml
+└── k8s/
+    ├── deployment.yaml
+    └── service.yaml
+```
 
-The project is built using tools like:
+---
 
-Node.js
+## Key Identifiers Reference
 
-Webpack
+| Resource | Value |
+|---|---|
+| ECR image URI | `367061003285.dkr.ecr.eu-north-1.amazonaws.com/brain-tasks-app` |
+| EKS cluster | `brain-tasks-cluster` (eu-north-1, k8s 1.34) |
+| NLB ARN | `arn:aws:elasticloadbalancing:eu-north-1:367061003285:loadbalancer/net/a097e0edcbe054381ae69dfb7caa746e/b814358c06e3bc51` |
+| CodeBuild project | `brain-tasks-app-build` |
+| CodePipeline | `brain-tasks-app-pipeline` |
+| Application log group | `/aws/containerinsights/brain-tasks-cluster/application` |
 
-Vite
+---
 
-React (or other frameworks)
+## Screenshots
 
-A dist/ folder is generated.
-
-Only the production build is deployed to servers.
-
-This repository represents step 4 only.
-
-Since this is already the compiled output:
-
-No dependencies are required
-
-No build process is required
-
-No package.json is needed
-
-## Deployment
-This application is deployed via a full CI/CD pipeline: GitHub -> AWS CodePipeline -> AWS CodeBuild -> Amazon ECR -> Amazon EKS.
-<-- pipeline trigger test 2 -->
+See accompanying submission document (Word) for step-by-step verification screenshots covering Docker build/test, ECR push, EKS cluster creation, deployment rollout, pipeline execution, and CloudWatch log verification.
